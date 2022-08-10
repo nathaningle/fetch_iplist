@@ -4,14 +4,20 @@ use std::path::PathBuf;
 use anyhow::{ensure, Context};
 use clap::{self, Parser};
 use ipnet::IpNet;
+use log::{debug, info, warn, LevelFilter};
 use nix::sys::stat::{fchmodat, lstat, mode_t, FchmodatFlags, FileStat, Mode, SFlag};
 use nix::unistd::{chown, Gid, Uid};
 use reqwest::Url;
+use simple_logger::SimpleLogger;
+use syslog::{BasicLogger, Facility, Formatter3164};
 use tempfile::NamedTempFile;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
+    /// Verbose logging to the console instead of syslog
+    #[clap(short, long, action)]
+    debug: bool,
     /// Path to directory where temporary files will be created
     #[clap(short, long, value_parser, value_name = "PATH")]
     tempdir: Option<PathBuf>,
@@ -26,11 +32,32 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    // Init logging.
+    if args.debug {
+        SimpleLogger::new()
+            .with_level(LevelFilter::Debug)
+            .init()
+            .expect("simple_logger failed to initialise");
+    } else {
+        let formatter = Formatter3164 {
+            facility: Facility::LOG_USER,
+            hostname: None,
+            process: "fetch_iplist".into(),
+            pid: 0,
+        };
+        let logger = syslog::unix(formatter).expect("syslog failed to initialise");
+        log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
+            .map(|()| log::set_max_level(LevelFilter::Info))?;
+    }
+
     if args.destfile.to_str() == Some("-") {
         // If we're writing to stdout, we don't need a temp file.
+        debug!("Writing to stdout");
         let nets: Vec<IpNet> = download_nets(args.urls)?;
         write_nets(std::io::stdout(), &nets)?;
     } else {
+        debug!("Writing to {} via temporary file", args.destfile.display());
+
         // Set up the temp file early, so we can bail before download if it fails.
         let tmp: NamedTempFile = match args.tempdir {
             Some(dir) => NamedTempFile::new_in(dir),
@@ -45,6 +72,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         .context("Failed to open temporary file")?;
+        debug!("Opened temporary file {}", tmp.path().display());
 
         // Read file metadata.
         let dest_stat: FileStat = lstat(&(args.destfile))?;
@@ -52,13 +80,12 @@ fn main() -> anyhow::Result<()> {
 
         // Sanity checks.
         ensure!(
-            tmp_stat.st_dev == dest_stat.st_dev,
-            "Destination and temporary files must be on the same filesystem to guarantee atomic replacement"
-        );
-        ensure!(
             !is_symlink(&dest_stat),
             "Destination file must not be a symbolic link"
         );
+        if tmp_stat.st_dev != dest_stat.st_dev {
+            warn!("Destination and temporary files must be on the same filesystem to guarantee atomic replacement");
+        }
 
         // Make tempfile ownership the same as destfile.
         let dest_uid: Option<Uid> =
@@ -66,12 +93,16 @@ fn main() -> anyhow::Result<()> {
         let dest_gid: Option<Gid> =
             (tmp_stat.st_gid != dest_stat.st_gid).then(|| Gid::from_raw(dest_stat.st_gid));
         if dest_uid.is_some() || dest_gid.is_some() {
+            debug!(
+                "Updating temporary file ownership to user {:?}, group {:?}",
+                dest_uid, dest_gid
+            );
             chown(tmp.path(), dest_uid, dest_gid)?;
         }
 
         // Download and aggregate the prefix lists.
-        // TODO: log to syslog
         let nets: Vec<IpNet> = download_nets(args.urls)?;
+        debug!("Writing network prefixes to temporary file");
         write_nets(&tmp, &nets)?;
         // TODO: stop here if tempfile == destfile
 
@@ -79,13 +110,16 @@ fn main() -> anyhow::Result<()> {
         // in case we would make it read-only.
         if tmp_stat.st_mode != dest_stat.st_mode {
             let dest_mode: Mode = Mode::from_bits_truncate(dest_stat.st_mode);
+            debug!("Updating temporary file permissions to {:?}", dest_mode);
             fchmodat(None, tmp.path(), dest_mode, FchmodatFlags::NoFollowSymlink)?
         }
 
         // Move the tempfile over the top of the destination file.
         tmp.as_file().sync_all()?;
-        let final_destfile = tmp.persist(args.destfile)?;
+        debug!("Moving temporary file to {}", args.destfile.display());
+        let final_destfile = tmp.persist(&args.destfile)?;
         final_destfile.sync_all()?;
+        info!("Updated {}", args.destfile.display());
     }
 
     Ok(())
@@ -123,7 +157,13 @@ fn download_nets(urls: Vec<Url>) -> anyhow::Result<Vec<IpNet>> {
         .collect::<Result<Vec<String>, reqwest::Error>>()?;
 
     let nets: Vec<IpNet> = bodies.iter().flat_map(|body| extract_nets(body)).collect();
-    Ok(IpNet::aggregate(&nets))
+    let agg_nets = IpNet::aggregate(&nets);
+    info!(
+        "Downloaded {} network prefixes, aggregated to {}",
+        nets.len(),
+        agg_nets.len()
+    );
+    Ok(agg_nets)
 }
 
 // True iff a character would be expected in an IPv4 or IPv6 network address.
