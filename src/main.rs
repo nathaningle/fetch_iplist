@@ -1,9 +1,11 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use clap::{self, Parser};
 use ipnet::IpNet;
+use nix::sys::stat::{fchmodat, lstat, mode_t, FchmodatFlags, FileStat, Mode, SFlag};
+use nix::unistd::{chown, Gid, Uid};
 use reqwest::Url;
 use tempfile::NamedTempFile;
 
@@ -44,18 +46,54 @@ fn main() -> anyhow::Result<()> {
         }
         .context("Failed to open temporary file")?;
 
-        // TODO: warn if temp file and destfile are on different filesystems
+        // Read file metadata.
+        let dest_stat: FileStat = lstat(&(args.destfile))?;
+        let tmp_stat: FileStat = lstat(tmp.path())?;
+
+        // Sanity checks.
+        ensure!(
+            tmp_stat.st_dev == dest_stat.st_dev,
+            "Destination and temporary files must be on the same filesystem to guarantee atomic replacement"
+        );
+        ensure!(
+            !is_symlink(&dest_stat),
+            "Destination file must not be a symbolic link"
+        );
+
+        // Make tempfile ownership the same as destfile.
+        let dest_uid: Option<Uid> =
+            (tmp_stat.st_uid != dest_stat.st_uid).then(|| Uid::from_raw(dest_stat.st_uid));
+        let dest_gid: Option<Gid> =
+            (tmp_stat.st_gid != dest_stat.st_gid).then(|| Gid::from_raw(dest_stat.st_gid));
+        if dest_uid.is_some() || dest_gid.is_some() {
+            chown(tmp.path(), dest_uid, dest_gid)?;
+        }
+
+        // Download and aggregate the prefix lists.
         // TODO: log to syslog
-        // TODO: handle download failure
-        // TODO: copy dest ownership and perms
         let nets: Vec<IpNet> = download_nets(args.urls)?;
         write_nets(&tmp, &nets)?;
+        // TODO: stop here if tempfile == destfile
+
+        // Make tempfile permissions the same as destfile.  Do this after writing to the tempfile
+        // in case we would make it read-only.
+        if tmp_stat.st_mode != dest_stat.st_mode {
+            let dest_mode: Mode = Mode::from_bits_truncate(dest_stat.st_mode);
+            fchmodat(None, tmp.path(), dest_mode, FchmodatFlags::NoFollowSymlink)?
+        }
+
+        // Move the tempfile over the top of the destination file.
         tmp.as_file().sync_all()?;
         let final_destfile = tmp.persist(args.destfile)?;
         final_destfile.sync_all()?;
     }
 
     Ok(())
+}
+
+// True iff the given FileStat is from a symbolic link.
+fn is_symlink(fs: &FileStat) -> bool {
+    SFlag::from_bits_truncate(fs.st_mode as mode_t).contains(SFlag::S_IFLNK)
 }
 
 // Write prefixes one per line in CIDR notation to something 'Write'able.

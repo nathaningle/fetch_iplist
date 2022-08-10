@@ -9,5 +9,6 @@ edition = "2021"
 anyhow = "1"
 clap = { version = "3.2", features = ["derive"] }
 ipnet = { version = "2", features = ["serde"] }
+nix = { version = "0.24", features = ["fs", "user"] }
 reqwest = { version = "0.11", features = ["blocking"] }
 tempfile = "3.3"
