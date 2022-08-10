@@ -43,7 +43,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
         .context("Failed to open temporary file")?;
-        println!("{:?}", tmp);
 
         // TODO: warn if temp file and destfile are on different filesystems
         // TODO: log to syslog
@@ -76,7 +75,13 @@ fn download_nets(urls: Vec<Url>) -> anyhow::Result<Vec<IpNet>> {
     let webclient = reqwest::blocking::Client::new();
     let bodies: Vec<String> = urls
         .into_iter()
-        .map(|url| webclient.get(url).send().and_then(|resp| resp.text()))
+        .map(|url| {
+            webclient
+                .get(url)
+                .send()
+                .and_then(|resp| resp.error_for_status())
+                .and_then(|resp| resp.text())
+        })
         .collect::<Result<Vec<String>, reqwest::Error>>()?;
 
     let nets: Vec<IpNet> = bodies.iter().flat_map(|body| extract_nets(body)).collect();
