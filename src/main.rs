@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{ensure, Context};
 use clap::{self, Parser};
 use ipnet::IpNet;
-use log::{debug, info, warn, LevelFilter};
+use log::{debug, error, info, warn, LevelFilter};
 use nix::sys::stat::{fchmodat, lstat, mode_t, FchmodatFlags, FileStat, Mode, SFlag};
 use nix::unistd::{chown, Gid, Uid};
 use reqwest::Url;
@@ -33,6 +33,17 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    match try_main() {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            error!("{}", e);
+            Err(e)
+        }
+    }
+}
+
+// Helper function wrapped by main() to facilitate error logging.
+fn try_main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Init logging.
