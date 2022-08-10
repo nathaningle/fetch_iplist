@@ -1,5 +1,6 @@
-use std::io::Write;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context};
 use clap::{self, Parser};
@@ -11,6 +12,8 @@ use reqwest::Url;
 use simple_logger::SimpleLogger;
 use syslog::{BasicLogger, Facility, Formatter3164};
 use tempfile::NamedTempFile;
+
+const BUFFER_LEN: usize = 1024 * 1024; // 1 MiB
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -104,25 +107,55 @@ fn main() -> anyhow::Result<()> {
         let nets: Vec<IpNet> = download_nets(args.urls)?;
         debug!("Writing network prefixes to temporary file");
         write_nets(&tmp, &nets)?;
-        // TODO: stop here if tempfile == destfile
 
-        // Make tempfile permissions the same as destfile.  Do this after writing to the tempfile
-        // in case we would make it read-only.
-        if tmp_stat.st_mode != dest_stat.st_mode {
-            let dest_mode: Mode = Mode::from_bits_truncate(dest_stat.st_mode);
-            debug!("Updating temporary file permissions to {:?}", dest_mode);
-            fchmodat(None, tmp.path(), dest_mode, FchmodatFlags::NoFollowSymlink)?
+        // Only update destfile if there are changes.
+        let final_tmp_stat: FileStat = lstat(tmp.path())?;
+        if final_tmp_stat.st_size == dest_stat.st_size
+            && compare_file_bytes(tmp.path(), &(args.destfile))?
+        {
+            info!("No changes to {}", args.destfile.display());
+        } else {
+            // Make tempfile permissions the same as destfile.  Do this after writing to the tempfile
+            // in case we would make it read-only.
+            if tmp_stat.st_mode != dest_stat.st_mode {
+                let dest_mode: Mode = Mode::from_bits_truncate(dest_stat.st_mode);
+                debug!("Updating temporary file permissions to {:?}", dest_mode);
+                fchmodat(None, tmp.path(), dest_mode, FchmodatFlags::NoFollowSymlink)?
+            }
+
+            // Move the tempfile over the top of the destination file.
+            tmp.as_file().sync_all()?;
+            debug!("Moving temporary file to {}", args.destfile.display());
+            let final_destfile = tmp.persist(&args.destfile)?;
+            final_destfile.sync_all()?;
+            info!("Updated {}", args.destfile.display());
         }
-
-        // Move the tempfile over the top of the destination file.
-        tmp.as_file().sync_all()?;
-        debug!("Moving temporary file to {}", args.destfile.display());
-        let final_destfile = tmp.persist(&args.destfile)?;
-        final_destfile.sync_all()?;
-        info!("Updated {}", args.destfile.display());
     }
 
     Ok(())
+}
+
+// True iff two files have the same contents.
+fn compare_file_bytes(path1: &Path, path2: &Path) -> io::Result<bool> {
+    let mut file1 = File::open(path1)?;
+    let mut file2 = File::open(path2)?;
+    let mut buf1 = [0; BUFFER_LEN];
+    let mut buf2 = [0; BUFFER_LEN];
+
+    loop {
+        let read_count1 = file1.read(&mut buf1)?;
+        let read_count2 = file2.read(&mut buf2)?;
+
+        if read_count1 != read_count2 || buf1 != buf2 {
+            return Ok(false);
+        }
+
+        if read_count1 != BUFFER_LEN {
+            break;
+        }
+    }
+
+    Ok(true)
 }
 
 // True iff the given FileStat is from a symbolic link.
