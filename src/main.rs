@@ -1,6 +1,8 @@
+use std::fmt::Debug;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{ExitCode, Termination};
 
 use anyhow::{ensure, Context};
 use clap::{self, Parser};
@@ -32,18 +34,37 @@ struct Args {
     urls: Vec<Url>,
 }
 
-fn main() -> anyhow::Result<()> {
+#[derive(Debug)]
+enum FinalStatus {
+    Changed,
+    NotChanged,
+    Failed,
+}
+
+impl Termination for FinalStatus {
+    fn report(self) -> ExitCode {
+        match self {
+            FinalStatus::Changed => ExitCode::SUCCESS,
+            // So that when used in a crontab, we can use `&&` to conditionally reload a service
+            // only when the destination file was updated.
+            FinalStatus::NotChanged => ExitCode::from(2),
+            FinalStatus::Failed => ExitCode::FAILURE,
+        }
+    }
+}
+
+fn main() -> FinalStatus {
     match try_main() {
-        Ok(_) => Ok(()),
+        Ok(finalstatus) => finalstatus,
         Err(e) => {
             error!("{}", e);
-            Err(e)
+            FinalStatus::Failed
         }
     }
 }
 
 // Helper function wrapped by main() to facilitate error logging.
-fn try_main() -> anyhow::Result<()> {
+fn try_main() -> anyhow::Result<FinalStatus> {
     let args = Args::parse();
 
     // Init logging.
@@ -69,6 +90,7 @@ fn try_main() -> anyhow::Result<()> {
         debug!("Writing to stdout");
         let nets: Vec<IpNet> = download_nets(args.urls)?;
         write_nets(std::io::stdout(), &nets)?;
+        Ok(FinalStatus::NotChanged)
     } else {
         debug!("Writing to {} via temporary file", args.destfile.display());
 
@@ -89,7 +111,12 @@ fn try_main() -> anyhow::Result<()> {
         debug!("Opened temporary file {}", tmp.path().display());
 
         // Read file metadata.
-        let dest_stat: FileStat = lstat(&(args.destfile))?;
+        let dest_stat: FileStat = lstat(&(args.destfile)).with_context(|| {
+            format!(
+                "Failed to read metadata for destination file {}",
+                args.destfile.display()
+            )
+        })?;
         let tmp_stat: FileStat = lstat(tmp.path())?;
 
         // Sanity checks.
@@ -98,7 +125,7 @@ fn try_main() -> anyhow::Result<()> {
             "Destination file must not be a symbolic link"
         );
         if tmp_stat.st_dev != dest_stat.st_dev {
-            warn!("Destination and temporary files must be on the same filesystem to guarantee atomic replacement");
+            warn!("Destination and temporary files should be on the same filesystem to guarantee atomic replacement");
         }
 
         // Make tempfile ownership the same as destfile.
@@ -125,6 +152,7 @@ fn try_main() -> anyhow::Result<()> {
             && compare_file_bytes(tmp.path(), &(args.destfile))?
         {
             info!("No changes to {}", args.destfile.display());
+            Ok(FinalStatus::NotChanged)
         } else {
             // Make tempfile permissions the same as destfile.  Do this after writing to the tempfile
             // in case we would make it read-only.
@@ -140,10 +168,9 @@ fn try_main() -> anyhow::Result<()> {
             let final_destfile = tmp.persist(&args.destfile)?;
             final_destfile.sync_all()?;
             info!("Updated {}", args.destfile.display());
+            Ok(FinalStatus::Changed)
         }
     }
-
-    Ok(())
 }
 
 // True iff two files have the same contents.
